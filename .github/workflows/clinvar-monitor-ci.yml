@@ -1,0 +1,72 @@
+name: ClinVar monitor CI
+
+# Fork-only CI for the ClinVar Variant Reclassification Monitor blueprint.
+#
+# NEVER include this file or ci/ in the upstream pull request: kestra-io/blueprints closes PRs that touch files outside flows/.
+# It is published ONLY as the single root (orphan, parentless) commit of the fork branch ci/clinvar-monitor, which holds exactly
+# three files: this workflow, ci/clinvar_monitor/check_flow.py and ci/clinvar_monitor/test_monitor.py. That branch shares no history
+# with main, so it cannot be merged or proposed upstream by accident. A push to it triggers this workflow, which checks out the
+# flow from the feature branch (default: feat/clinvar-variant-reclassification-monitor) and runs:
+#   1. structure-aware static checks (YAML, embedded Python compile, secrets, credential literals, workflow safety)
+#   2. the unit tests, which run the embedded script against a LOCAL MOCK of NCBI E-utilities
+# It uses no repository secrets, never contacts NCBI or Slack, and never runs the flow on Kestra.
+
+on:
+  push:
+    branches:
+      - ci/clinvar-monitor
+  workflow_dispatch:
+    inputs:
+      flow_ref:
+        description: Branch or tag of this repository that holds flows/clinvar-variant-reclassification-monitor.yaml
+        required: false
+        default: feat/clinvar-variant-reclassification-monitor
+
+permissions:
+  contents: read
+
+concurrency:
+  group: clinvar-monitor-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  checks:
+    name: Static checks and mock-based tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out the CI files (this branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the flow under test (read-only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.flow_ref || 'feat/clinvar-variant-reclassification-monitor' }}
+          path: flow-under-test
+          persist-credentials: false
+
+      - name: Set up Python 3.12 (the version of the flow's python:3.12-slim container)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML (the only dependency)
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: "pyyaml==6.0.3"
+
+      - name: Static checks on the flow and on this workflow
+        run: >
+          python ci/clinvar_monitor/check_flow.py
+          --flow flow-under-test/flows/clinvar-variant-reclassification-monitor.yaml
+          --flows-dir flow-under-test/flows
+          --workflow .github/workflows/clinvar-monitor-ci.yml
+
+      - name: Unit tests (embedded script against a local mock NCBI, no external network)
+        env:
+          CLINVAR_FLOW: ${{ github.workspace }}/flow-under-test/flows/clinvar-variant-reclassification-monitor.yaml
+        run: python -I ci/clinvar_monitor/test_monitor.py
