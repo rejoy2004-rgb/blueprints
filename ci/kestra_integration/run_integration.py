@@ -6,7 +6,9 @@ environment (KESTRA_USER, KESTRA_PASSWORD). Every printed line passes through re
 encoded forms.
 
 Evidence. Kestra 2.0 no longer returns task outputs from the execution endpoint, so nothing REQUIRED depends on them. Results come from:
-  * the execution logs (the flow's own log lines: summary, loopOutputs line, failure reasons),
+  * the execution logs (the flow's own log lines: summary, loopOutputs line, failure reasons) of the parent AND of its loop sub-execution:
+    each Loop iteration runs as a separate execution (kind LOOP, parentId = the parent), so read_snapshot, compare_snapshots, report_gene,
+    notify_changes, save_snapshot and the script output live there, found by an execution search with an explicit kind filter,
   * the KV snapshot written by the flow,
   * the Docker daemon (container create events) and the pinned image's metadata, which are independent of Kestra's API,
   * the execution state, plus taskRunList states and task outputs when the server happens to return them (optional).
@@ -66,11 +68,17 @@ SECRETS = []
 LAST_REPORT = None  # the Report of the most recent main() call (read by the tests)
 
 
+SENSITIVE_PATTERNS = (re.compile(r"https?://hooks\.slack\.com/\S+"), re.compile(r"(?i)\b(api[_-]?key|token|secret|password|authorization)\b(\s*[=:]\s*)\S+"),
+                      re.compile(r"(?i)bearer\s+\S+"), re.compile(r"(?i)basic\s+[A-Za-z0-9+/=]{12,}"))
+
+
 def redact(text):
     for secret in SECRETS:
         if secret:
             text = text.replace(secret, "***")
-    return text
+    for pattern in SENSITIVE_PATTERNS[:1] + SENSITIVE_PATTERNS[2:]:
+        text = pattern.sub("***", text)
+    return SENSITIVE_PATTERNS[1].sub(lambda m: m.group(1) + m.group(2) + "***", text)
 
 
 def say(*parts):
@@ -284,6 +292,38 @@ def today_days():
     return {str(today), str(today - timedelta(days=1))}
 
 
+def group_logs(rows):
+    """'taskId/LEVEL=count, ...' for log entries; no message text."""
+    if rows is None:
+        return "unavailable"
+    counts = {}
+    for row in rows:
+        key = "%s/%s" % (row.get("taskId") or "-", row.get("level") or "-")
+        counts[key] = counts.get(key, 0) + 1
+    return ", ".join("%s=%d" % kv for kv in sorted(counts.items())) or "no entries"
+
+
+class Evidence:
+    """What one parent execution and its loop sub-execution(s) expose. `rows` is None when the parent's logs were unavailable;
+    `children` is None when the sub-executions could not be listed; `problem` says why the view may be partial."""
+
+    def __init__(self, parent, rows, children, problem):
+        self.parent, self.rows, self.children, self.problem = parent, rows, children, problem
+
+    @property
+    def children_found(self):
+        return self.children is not None and not self.problem and len(self.children) >= 1 and all(c["execution"] is not None for c in self.children)
+
+    @property
+    def complete(self):
+        return self.rows is not None and self.children_found and all(c["rows"] is not None for c in self.children)
+
+    def all_rows(self):
+        return list(self.rows or []) + [r for c in self.children or [] for r in c["rows"] or []]
+
+    def blob(self):
+        return "\n".join(str(r.get("message", "")) for r in self.all_rows())
+
 class Driver:
     def __init__(self, client, report, poll):
         self.client, self.report, self.poll = client, report, poll
@@ -416,31 +456,128 @@ class Driver:
         value = data["value"]
         return "ok", value if isinstance(value, str) else json.dumps(value, separators=(",", ":"), sort_keys=True)
 
-    # ---------------------------------------------------------------- shared checks
-    def slack_check(self, label, key, execution, rows):
-        """Critical: evidence that no Slack task ran. From taskRunList states if returned, else from task-tagged log entries."""
-        name = "%s: no Slack task ran (notify_slack=false)" % label
-        by_id = tasks_by_id(execution)
-        if by_id is not None:
-            ran = {t: task_state(execution, t) for t in SLACK_TASKS if t in by_id}
-            bad = {t: s for t, s in ran.items() if any(x != "SKIPPED" for x in s)}
-            self.report.check(name, not bad, "from taskRunList; Slack tasks listed: %s" % (ran or "none"), key=key)
-            return
-        ids = {r.get("taskId") for r in (rows or []) if r.get("taskId")}
-        if "compare_snapshots" in ids:
-            bad = ids & set(SLACK_TASKS)
-            self.report.check(name, not bad, "from log entries tagged with taskId (seen: %s)" % sorted(ids), key=key)
-            return
-        self.report.unverified(name, "neither a taskRunList nor task-tagged log entries are available", key=key)
+    # ---------------------------------------------------------------- loop sub-executions
+    def children(self, parent_id):
+        """Loop iterations run as separate sub-executions: kind LOOP, parentId = the parent execution (Kestra v2.0.6 source,
+        Execution.loopExecution). The default execution search lists NORMAL executions only, so the kind filter is explicit.
+        Returns (rows, problem); rows is None when the search did not answer in the expected shape."""
+        query = urllib.parse.urlencode({"filters[kind][EQUALS]": "LOOP", "filters[parentId][EQUALS]": parent_id, "size": "100"})
+        status, data, _ = self.client.json("GET", "%s/executions/search?%s" % (self.client.prefix, query))
+        results = data.get("results") if isinstance(data, dict) else data if isinstance(data, list) else None
+        if status != 200 or not isinstance(results, list):
+            return None, "the execution search answered HTTP %s without a results list" % status
+        rows = [r for r in results if isinstance(r, dict) and r.get("id") and r.get("parentId", parent_id) == parent_id]
+        return rows, ""
 
-    def task_states_check(self, label, execution):
-        """Optional: all flow tasks SUCCESS, only when the server returns a taskRunList."""
-        by_id = tasks_by_id(execution)
-        if by_id is None:
-            self.report.info("%s: per-task states" % label, "the execution JSON has no taskRunList; optional, nothing required depends on it")
+    def gather(self, label, execution, expected_children=1):
+        """The parent's logs plus the logs and task states of its loop sub-execution(s), then diagnostics (INFO)."""
+        parent_id = execution.get("id")
+        deadline = time.monotonic() + float(os.environ.get("DRIVER_EVIDENCE_TIMEOUT", "60"))
+        rows, problem, failures = None, "", 0
+        while True:
+            rows, problem = self.children(parent_id)
+            if rows is None:
+                failures += 1
+            elif len(rows) >= expected_children and all(state_of(self.fetch(r["id"])[0]) in TERMINAL for r in rows):
+                break
+            if failures >= 3 or time.monotonic() >= deadline:
+                break
+            time.sleep(self.poll)
+        children = None
+        if rows is not None:
+            children = [{"id": r["id"], "execution": self.fetch(r["id"])[0], "rows": self.logs(r["id"])} for r in rows]
+            if len(rows) != expected_children:
+                problem = "found %d loop sub-execution(s), expected %d" % (len(rows), expected_children)
+        evidence = Evidence(execution, self.logs(parent_id), children, problem)
+        self.diagnostics(label, evidence, rows)
+        return evidence
+
+    def diagnostics(self, label, ev, search_rows):
+        """INFO lines only: ids, states, counts and key names. No message bodies, no environment, no raw responses."""
+        def states(execution):
+            by_id = tasks_by_id(execution)
+            return "absent" if by_id is None else ", ".join("%s=%s" % (t, "/".join(str(s) for s in task_state(execution, t))) for t in by_id) or "empty"
+        self.report.info("%s diagnostics: parent taskRunList" % label, states(ev.parent))
+        self.report.info("%s diagnostics: parent logs by taskId/level" % label, group_logs(ev.rows))
+        self.report.info("%s diagnostics: execution search kind=LOOP parentId=%s" % (label, ev.parent.get("id")),
+                         "unavailable: %s" % ev.problem if search_rows is None else "%d row(s); row keys %s" % (len(search_rows), sorted(search_rows[0])[:24] if search_rows else []))
+        for child in ev.children or []:
+            execution = child["execution"] or {}
+            loop_run = execution.get("loopRun")
+            self.report.info("%s diagnostics: sub-execution %s" % (label, child["id"]),
+                             "kind=%s state=%s parentId=%s loopRun keys=%s; taskRunList: %s; logs by taskId/level: %s" % (
+                                 execution.get("kind"), state_of(execution), execution.get("parentId"),
+                                 sorted(loop_run)[:10] if isinstance(loop_run, dict) else None, states(execution), group_logs(child["rows"])))
+
+    # ---------------------------------------------------------------- shared checks
+    def slack_check(self, label, key, ev, failed):
+        """Critical. PASS only when the evidence COVERS the nested tasks. Slack tasks live inside the Loop iteration (slack_alert) or
+        the errors block (slack_failure); absence from a list that cannot show them proves nothing, so that case is UNVERIFIED."""
+        name = "%s: no Slack task ran (notify_slack=false)" % label
+        seen = {}
+        for execution in [ev.parent] + [c["execution"] for c in ev.children or []]:
+            by_id = tasks_by_id(execution)
+            for task in SLACK_TASKS:
+                if by_id and task in by_id:
+                    seen.setdefault(task, []).extend(task_state(execution, task))
+        log_ids = {r.get("taskId") for r in ev.all_rows() if r.get("taskId")}
+        bad = {t: s for t, s in seen.items() if any(x != "SKIPPED" for x in s)}
+        logged = sorted(log_ids & set(SLACK_TASKS))
+        if bad or logged:
+            self.report.check(name, False, "Slack task evidence found: states %s, log taskIds %s" % (bad, logged), key=key)
             return
-        bad = {t: task_state(execution, t) for t in EXPECTED_TASKS if task_state(execution, t) != ["SUCCESS"]}
-        self.report.check("%s: all %d tasks ended SUCCESS" % (label, len(EXPECTED_TASKS)), not bad, str(bad) if bad else "")
+        parent_marker = "log_failure" if failed else "run_summary"
+        parent_ids = (tasks_by_id(ev.parent) or {}).keys() if tasks_by_id(ev.parent) is not None else None
+        lists_cover = (parent_ids is not None and parent_marker in parent_ids and ev.children_found
+                       and all("compare_snapshots" in (tasks_by_id(c["execution"]) or {}) for c in ev.children))
+        parent_log_ids = {r.get("taskId") for r in ev.rows or []}
+        logs_cover = (ev.rows is not None and parent_marker in parent_log_ids and ev.children_found
+                      and all("compare_snapshots" in {r.get("taskId") for r in c["rows"] or []} for c in ev.children))
+        if lists_cover:
+            self.report.check(name, True, "task lists of the parent (contains %s) and of the loop sub-execution (contains compare_snapshots) show no Slack task" % parent_marker, key=key)
+        elif logs_cover:
+            self.report.check(name, True, "task-tagged logs of the parent (%s) and of the loop sub-execution (compare_snapshots) show no Slack task" % parent_marker, key=key)
+        else:
+            self.report.unverified(name, "the evidence does not cover the nested tasks (%s); absence of Slack tasks from a partial view is not proof"
+                                   % (ev.problem or "task lists or task-tagged logs of the parent or the sub-execution are missing"), key=key)
+
+    def task_states_check(self, label, ev):
+        """All seven flow tasks ended SUCCESS across the parent AND the loop sub-execution (notify_changes is an If: SUCCESS or SKIPPED)."""
+        name = "%s: all %d tasks ended SUCCESS (parent and loop sub-execution)" % (label, len(EXPECTED_TASKS))
+        if tasks_by_id(ev.parent) is None or not ev.children_found or any(tasks_by_id(c["execution"]) is None for c in ev.children):
+            self.report.unverified(name, ev.problem or "task lists of the parent or the sub-execution are not available")
+            return
+        merged = {"taskRunList": [run for e in [ev.parent] + [c["execution"] for c in ev.children] for run in e["taskRunList"] if isinstance(run, dict)]}
+        bad = {}
+        for task in EXPECTED_TASKS:
+            states = task_state(merged, task)
+            if states != ["SUCCESS"] and not (task == "notify_changes" and states in (["SUCCESS"], ["SKIPPED"])):
+                bad[task] = states
+        self.report.check(name, not bad, str(bad) if bad else "")
+
+    def child_state_check(self, label, ev, expected, failing_task=None):
+        name = "%s: the loop sub-execution ended %s%s" % (label, expected, (" in task %s" % failing_task) if failing_task else "")
+        if not ev.children_found or any(c["execution"] is None for c in ev.children):
+            self.report.unverified(name, ev.problem or "the sub-execution could not be read")
+            return
+        states = [state_of(c["execution"]) for c in ev.children]
+        ok = states == [expected]
+        if ok and failing_task:
+            by_id = tasks_by_id(ev.children[0]["execution"])
+            if by_id is None:
+                self.report.unverified(name, "the sub-execution has no taskRunList")
+                return
+            ok = "FAILED" in task_state(ev.children[0]["execution"], failing_task)
+        self.report.check(name, ok, "sub-execution states %s" % states)
+
+    def text_check(self, name, needle, ev):
+        """PASS when the text is in the logs; FAIL only when the logs are complete and it is absent; UNVERIFIED when the view is partial."""
+        if needle in ev.blob():
+            self.report.check(name, True)
+        elif ev.complete:
+            self.report.check(name, False, "not found in %d log entries (parent %d, sub-execution(s) %d)" % (len(ev.all_rows()), len(ev.rows or []), len(ev.all_rows()) - len(ev.rows or [])))
+        else:
+            self.report.unverified(name, ev.problem or "the logs of the parent or of the loop sub-execution are not available")
 
     def shape_info(self, execution, rows):
         runs = (execution or {}).get("taskRunList")
@@ -469,23 +606,25 @@ class Driver:
         self.report.check("%s: execution ends SUCCESS" % label, state_of(ex) == "SUCCESS", "state %s in %ds" % (state_of(ex), time.monotonic() - started), key="s1_success")
         if ex is None:
             return None
-        rows = self.logs(ex.get("id"))
-        self.slack_check(label, "s1_slack", ex, rows)
-        self.task_states_check(label, ex)
-        self.shape_info(ex, rows)
+        ev = self.gather(label, ex)
+        self.slack_check(label, "s1_slack", ev, failed=False)
+        self.task_states_check(label, ev)
+        self.child_state_check(label, ev, "SUCCESS")
+        self.shape_info(ex, ev.rows)
         self.report.info("%s: size of the execution JSON" % label, "%d bytes" % size)
-        summary = parse_summary(self.blob(rows), gene) if rows is not None else None
-        if rows is None:
-            self.report.unverified("%s: the script's summary line and the loopOutputs line in the logs" % label, "the logs endpoint did not answer in the expected shape")
-        elif summary is None:
-            self.report.unverified("%s: the script's summary line in the logs" % label, "no 'GENE: PHASE (mode). scanned=...' line found in %d log entries" % len(rows))
+        blob = ev.blob()
+        summary = parse_summary(blob, gene) if ev.rows is not None or ev.children_found else None
+        if summary is None:
+            self.report.unverified("%s: the script's summary line in the logs" % label, ev.problem or "no 'GENE: PHASE (mode). scanned=...' line found in %d log entries" % len(ev.all_rows()))
         else:
             self.report.check("%s: the logged summary shows a full-scan baseline" % label,
                               summary["phase"] == "BASELINE" and summary["mode"] == "full" and summary["scanned"] == summary["total"] > 0,
                               "phase=%s mode=%s scanned=%s of %s, %s request(s)" % (summary["phase"], summary["mode"], summary["scanned"], summary["total"], summary["requests"]))
-            blob = self.blob(rows)
-            self.report.check("%s: the baseline sent no alert (log says so)" % label, "No alert is sent on the first run" in blob)
-            self.report.check("%s: run_summary printed the gene line built with loopOutputs()" % label, "ClinVar monitor finished" in blob and ("%s: BASELINE" % gene) in blob)
+        self.text_check("%s: the baseline sent no alert (the script's log line says so)" % label, "No alert is sent on the first run", ev)
+        if ev.rows is None:
+            self.report.unverified("%s: run_summary printed the gene line built with loopOutputs()" % label, "the parent's logs are not available")
+        else:
+            self.report.check("%s: run_summary printed the gene line built with loopOutputs()" % label, "ClinVar monitor finished" in self.blob(ev.rows) and ("%s: BASELINE" % gene) in self.blob(ev.rows))
         status, value = self.kv(ns, "%s_%s" % (prefix, gene.lower()))
         name = "%s: the snapshot is in the KV store as a schema 2 snapshot for %s with entries" % (label, gene)
         snap = None
@@ -516,19 +655,20 @@ class Driver:
         self.report.check("%s: execution ends SUCCESS" % label, state_of(ex) == "SUCCESS", "state %s" % state_of(ex), key="s2_success")
         if ex is None:
             return None
-        rows = self.logs(ex.get("id"))
-        self.slack_check(label, "s2_slack", ex, rows)
-        self.task_states_check(label, ex)
-        if rows is None:
-            self.report.unverified("%s: the logged summary shows an incremental scan" % label, "the logs endpoint did not answer in the expected shape")
+        ev = self.gather(label, ex)
+        self.slack_check(label, "s2_slack", ev, failed=False)
+        self.task_states_check(label, ev)
+        self.child_state_check(label, ev, "SUCCESS")
+        summary = parse_summary(ev.blob(), gene) if ev.rows is not None or ev.children_found else None
+        if summary is None:
+            self.report.unverified("%s: the logged summary shows an incremental scan" % label, ev.problem or "no summary line in %d log entries" % len(ev.all_rows()))
         else:
-            summary = parse_summary(self.blob(rows), gene)
-            if summary is None:
-                self.report.unverified("%s: the logged summary shows an incremental scan" % label, "no summary line in %d log entries" % len(rows))
+            self.report.check("%s: the logged summary shows an incremental scan" % label, summary["mode"] == "incremental" and summary["phase"] in ("NO CHANGES", "CHANGES"),
+                              "phase=%s mode=%s scanned=%s of %s" % (summary["phase"], summary["mode"], summary["scanned"], summary["total"]))
+            if ev.complete:
+                self.report.check("%s: no reconciliation line (that is for scheduled full scans only)" % label, "RECONCILIATION:" not in ev.blob())
             else:
-                self.report.check("%s: the logged summary shows an incremental scan" % label, summary["mode"] == "incremental" and summary["phase"] in ("NO CHANGES", "CHANGES"),
-                                  "phase=%s mode=%s scanned=%s of %s" % (summary["phase"], summary["mode"], summary["scanned"], summary["total"]))
-                self.report.check("%s: no reconciliation line (that is for scheduled full scans only)" % label, "RECONCILIATION:" not in self.blob(rows))
+                self.report.unverified("%s: no reconciliation line (that is for scheduled full scans only)" % label, ev.problem or "the sub-execution's logs are not available")
         status, value = self.kv(ns, "%s_%s" % (prefix, gene.lower()))
         name = "%s: the checkpoint advanced and the full-scan date did not move" % label
         try:
@@ -549,9 +689,9 @@ class Driver:
         bad = "ZZZNOTAGENE9"
         ex, _ = self.run(ns, fid, self.inputs(bad, prefix))
         self.report.check("%s: execution ends FAILED" % label, state_of(ex) == "FAILED", "state %s" % state_of(ex), key="s3_failed")
-        rows = self.logs(ex.get("id")) if ex else None
-        if ex is not None:
-            self.slack_check(label, "s3_slack", ex, rows)
+        ev = self.gather(label, ex) if ex else None
+        if ev is not None:
+            self.slack_check(label, "s3_slack", ev, failed=True)
         else:
             self.report.unverified("%s: no Slack task ran (notify_slack=false)" % label, "there is no execution to inspect", key="s3_slack")
         status, value = self.kv(ns, "%s_%s" % (prefix, bad.lower()))
@@ -563,28 +703,24 @@ class Driver:
         else:
             self.report.unverified(name, "KV lookup answered %s" % status, key="s3_no_snapshot_for_bad_gene")
         self.same_kv(label, "s3_kv_unchanged", ns, "%s_%s" % (prefix, gene.lower()), kv_before)
-        if rows is None:
-            self.report.unverified("%s: the failure reason and the error handler in the logs" % label, "the logs endpoint did not answer in the expected shape")
-        else:
-            blob = self.blob(rows)
-            self.report.check("%s: the logs state that ClinVar does not recognise the query" % label, "does not recognise part of the query" in blob)
-            self.report.check("%s: the errors block logged the failure (log_failure)" % label, "ClinVar monitor FAILED in flow" in blob)
+        if ev is not None:
+            self.child_state_check(label, ev, "FAILED", failing_task="compare_snapshots")
+            self.text_check("%s: the logs state that ClinVar does not recognise the query" % label, "does not recognise part of the query", ev)
+            self.text_check("%s: the errors block logged the failure (log_failure)" % label, "ClinVar monitor FAILED in flow", ev)
 
     def s4_query_mismatch(self, ns, fid, gene, prefix, kv_before):
         label = "S4 changed extra query"
         ex, _ = self.run(ns, fid, self.inputs(gene, prefix, extra_query="foo[bar]"))
         self.report.check("%s: execution ends FAILED" % label, state_of(ex) == "FAILED", "state %s" % state_of(ex), key="s4_failed")
-        rows = self.logs(ex.get("id")) if ex else None
-        if ex is not None:
-            self.slack_check(label, "s4_slack", ex, rows)
+        ev = self.gather(label, ex) if ex else None
+        if ev is not None:
+            self.slack_check(label, "s4_slack", ev, failed=True)
         else:
             self.report.unverified("%s: no Slack task ran (notify_slack=false)" % label, "there is no execution to inspect", key="s4_slack")
         self.same_kv(label, "s4_kv_unchanged", ns, "%s_%s" % (prefix, gene.lower()), kv_before)
-        if rows is None:
-            self.report.unverified("%s: the failure reason in the logs" % label, "the logs endpoint did not answer in the expected shape")
-        else:
-            self.report.check("%s: the logs name the different extra query" % label, "different extra query" in self.blob(rows))
-
+        if ev is not None:
+            self.child_state_check(label, ev, "FAILED", failing_task="compare_snapshots")
+            self.text_check("%s: the logs name the different extra query" % label, "different extra query", ev)
     def s5_concurrency(self, ns, fid, gene, prefix):
         label = "S5 concurrency"
         ids = [None, None]

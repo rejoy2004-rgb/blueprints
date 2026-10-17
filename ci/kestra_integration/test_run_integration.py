@@ -62,10 +62,16 @@ class FakeKestra:
     """Imitates the Kestra endpoints the driver uses. Behaviour switches let tests inject faults."""
 
     def __init__(self, version="2.0.6", prefix="/api/v1/main", enforce_concurrency=True, logs=True, run_slack=False,
-                 tamper_kv_on_failure=False, flow_validation_error=False, stall=False, task_list=False, outputs=False,
-                 configs=True, task_ids_in_logs=True, empty_kv_after_baseline=False, label=None):
-        # Kestra 2.0 execution JSON carries no task outputs, so the fake omits them by default (outputs=True adds them, task_list=True adds states)
+                 tamper_kv_on_failure=False, flow_validation_error=False, stall=False, task_list=True, outputs=False,
+                 configs=True, task_ids_in_logs=True, empty_kv_after_baseline=False, label=None, search="ok", search_lag=0,
+                 child_task_list=True, child_logs=True, children_count=1):
+        # Kestra 2.0 models like the real server (v2.0.6 source): the execution JSON carries no task outputs, and each Loop iteration runs as
+        # a separate sub-execution (kind LOOP, parentId = the parent) that is found only by an execution search with an explicit kind filter.
+        # The parent lists validate_genes, watch_genes, run_summary / log_failure; read_snapshot, compare_snapshots, report_gene,
+        # notify_changes, save_snapshot (and slack_alert) belong to the sub-execution.
         self.task_list, self.outputs, self.configs, self.label = task_list, outputs, configs, label
+        self.search, self.search_lag, self.child_task_list, self.child_logs, self.children_count = search, search_lag, child_task_list, child_logs, children_count
+        self.child_execs, self.search_calls = {}, 0
         self.task_ids_in_logs, self.empty_kv_after_baseline = task_ids_in_logs, empty_kv_after_baseline
         self.version, self.prefix, self.stall = version, prefix, stall
         self.enforce_concurrency, self.logs_enabled, self.run_slack = enforce_concurrency, logs, run_slack
@@ -151,6 +157,8 @@ class FakeKestra:
             m = re.fullmatch(re.escape(p) + r"/executions/([^/]+)/([^/]+)", path)
             if method == "POST" and m:
                 return self.create_execution(h, body)
+            if method == "GET" and path == p + "/executions/search":
+                return self.search_executions(h)
             m = re.fullmatch(re.escape(p) + r"/executions/([^/]+)", path)
             if method == "GET" and m:
                 return self.get_execution(h, m.group(1))
@@ -158,8 +166,10 @@ class FakeKestra:
             if method == "GET" and m:
                 if not self.logs_enabled:
                     return self.send(h, 404, {})
-                rows = self.executions[m.group(1)].get("logs", [])
-                return self.send(h, 200, [dict({"message": x}, **({"taskId": t} if self.task_ids_in_logs else {})) for t, x in rows])
+                target = self.executions.get(m.group(1)) or self.child_execs.get(m.group(1))
+                if target is None or (target.get("kind") == "LOOP" and not self.child_logs):
+                    return self.send(h, 404, {})
+                return self.send(h, 200, [dict({"message": x, "level": lv}, **({"taskId": t} if self.task_ids_in_logs else {})) for t, lv, x in target.get("logs", [])])
             m = re.fullmatch(re.escape(p) + r"/namespaces/([^/]+)/kv/([^/]+)", path)
             if method == "GET" and m:
                 key = urllib.parse.unquote(m.group(2))
@@ -187,12 +197,40 @@ class FakeKestra:
         self.order.append(ex_id)
         self.send(h, 200, {"id": ex_id})
 
+    def search_executions(self, h):
+        """Like the real server: without an explicit kind filter only NORMAL executions are listed, so loop sub-executions are invisible."""
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(h.path).query)
+        self.search_calls += 1
+        if self.search == "error":
+            return self.send(h, 500, {"message": "boom"})
+        if self.search == "malformed":
+            return self.send(h, 200, {"unexpected": True})
+        kind = (query.get("filters[kind][EQUALS]") or [None])[0]
+        parent = (query.get("filters[parentId][EQUALS]") or [None])[0]
+        if kind != "LOOP" or self.search == "empty" or self.search_calls <= self.search_lag:
+            return self.send(h, 200, {"results": [], "total": 0})
+        rows = [self.child_summary(c) for c in self.child_execs.values() if c["parentId"] == parent]
+        return self.send(h, 200, {"results": rows, "total": len(rows)})
+
+    @staticmethod
+    def child_summary(child):
+        return {"id": child["id"], "parentId": child["parentId"], "kind": "LOOP", "state": {"current": child["state"]}, "flowId": "x", "namespace": "y"}
+
     def get_execution(self, h, ex_id):
         ex = self.executions.get(ex_id)
+        if ex is None and ex_id in self.child_execs:
+            return self.send(h, 200, self.render_child(self.child_execs[ex_id]))
         if ex is None:
             return self.send(h, 404, {})
         self.tick()
         self.send(h, 200, self.render(ex))
+
+    def render_child(self, child):
+        data = {"id": child["id"], "kind": "LOOP", "parentId": child["parentId"], "state": {"current": child["state"], "histories": []},
+                "loopRun": {"index": 0, "taskId": "watch_genes", "taskRunId": "tr1", "value": child["gene"], "parents": []}}
+        if self.child_task_list:
+            data["taskRunList"] = [{k: v for k, v in t.items() if k != "outputs"} for t in child["tasks"]]
+        return data
 
     def tick(self):
         """Every poll advances ALL executions, like a real server where executions progress on their own."""
@@ -231,16 +269,22 @@ class FakeKestra:
         existing = json.loads(self.kv[key]) if key in self.kv else None
         extra = inputs.get("extra_query", "")
         today = datetime.now(timezone.utc).date().isoformat()
-        ok = ["validate_genes", "read_snapshot"]
-        tasks = [self.task(t, "SUCCESS") for t in ok]
+        parent_tasks = [self.task("validate_genes", "SUCCESS")]
+        child_id = ex["id"] + "-it0"
+        child = {"id": child_id, "parentId": ex["id"], "kind": "LOOP", "gene": gene, "tasks": [self.task("read_snapshot", "SUCCESS")], "logs": [], "state": "SUCCESS"}
         failed = gene.startswith("ZZZ") or (existing is not None and (existing.get("query") or "") != extra)
         if failed:
-            tasks += [self.task("compare_snapshots", "FAILED"), self.task("log_failure", "SUCCESS")]
+            child["tasks"].append(self.task("compare_snapshots", "FAILED"))
+            child["state"] = "FAILED"
             reason = ("ClinVar does not recognise part of the query for %s: ['%s[gene]']." % (gene, gene)) if gene.startswith("ZZZ") else (
                 "Stored snapshot was built with a different extra query ('', now %r)" % extra)
-            ex["logs"] = [("compare_snapshots", reason), ("log_failure", "ClinVar monitor FAILED in flow clinvar-variant-reclassification-monitor")]
+            child["logs"] = [("compare_snapshots", "ERROR", reason)]
+            parent_tasks += [self.task("watch_genes", "FAILED"), self.task("log_failure", "SUCCESS"), self.task("alert_failure", "SUCCESS")]
+            ex["logs"] = [("watch_genes", "ERROR", 'Loop iteration 0 ended in FAILED in sub-execution [[link execution="%s" flowId="f" namespace="n"]], check that execution\'s logs for details' % child_id),
+                          ("log_failure", "ERROR", "ClinVar monitor FAILED in flow clinvar-variant-reclassification-monitor")]
             if self.run_slack:
-                ex["logs"].append(("slack_failure", "slack sent"))
+                parent_tasks.append(self.task("slack_failure", "SUCCESS"))
+                ex["logs"].append(("slack_failure", "INFO", "slack sent"))
             if self.tamper_kv_on_failure and existing:
                 existing["checkpoint"] = "1999-01-01"
                 self.kv[key] = json.dumps(existing, separators=(",", ":"))
@@ -249,31 +293,30 @@ class FakeKestra:
             if existing is None:
                 snap = {"schema": 2, "gene": gene, "query": extra, "checkpoint": today, "reconciled": today, "classes": ["Pathogenic"], "reviews": ["x"],
                         "variants": {str(i): [0, 0] for i in range(707)}}
-                v = {"gene": gene, "mode": "FULL", "baseline": True, "phase": "BASELINE", "alertable": False, "scanned": 707, "total_matches": 707,
-                     "slack_text": "", "summary": "%s: BASELINE (full). scanned=707 of 707" % gene, "date_window_comparison": "NOT APPLICABLE"}
                 line = self.summary_line(gene, "BASELINE", "full", 707, 707, 707, 6)
-                ex["logs"] = [("compare_snapshots", "Pulling image python:3.12-slim for the task"),
-                              ("compare_snapshots", "  Baseline stored for %s: 707 records. No alert is sent on the first run." % gene),
-                              ("compare_snapshots", line),
-                              ("run_summary", "ClinVar monitor finished.\n- %s" % line)]
+                child["logs"] = [("compare_snapshots", "INFO", "Pulling image python:3.12-slim for the task"),
+                                 ("compare_snapshots", "INFO", "  Baseline stored for %s: 707 records. No alert is sent on the first run." % gene),
+                                 ("compare_snapshots", "INFO", line)]
             else:
                 snap = dict(existing, checkpoint=today)
-                v = {"gene": gene, "mode": "INCREMENTAL", "baseline": False, "phase": "NO CHANGES", "alertable": False, "scanned": 28, "total_matches": 28,
-                     "slack_text": "", "summary": "%s: NO CHANGES (incremental)" % gene, "date_window_comparison": "NOT APPLICABLE"}
                 line = self.summary_line(gene, "NO CHANGES", "incremental", 28, 28, 707, 3)
-                ex["logs"] = [("compare_snapshots", line), ("run_summary", "ClinVar monitor finished.\n- %s" % line)]
+                child["logs"] = [("compare_snapshots", "INFO", line)]
+            ex["logs"] = [("run_summary", "INFO", "ClinVar monitor finished.\n- %s" % line)]
             self.kv[key] = json.dumps(snap, separators=(",", ":"))
             if self.empty_kv_after_baseline and existing is None:
                 self.kv[key] = json.dumps({"schema": 2, "gene": gene, "variants": {}})
-            tasks += [self.task("compare_snapshots", "SUCCESS", {"vars": v}), self.task("report_gene", "SUCCESS"), self.task("notify_changes", "SUCCESS"),
-                      self.task("save_snapshot", "SUCCESS"), self.task("run_summary", "SUCCESS")]
+            child["tasks"] += [self.task("compare_snapshots", "SUCCESS", {"vars": {"summary": line}}), self.task("report_gene", "SUCCESS"),
+                               self.task("notify_changes", "SKIPPED" if not self.run_slack else "SUCCESS"), self.task("save_snapshot", "SUCCESS")]
+            parent_tasks += [self.task("watch_genes", "SUCCESS"), self.task("run_summary", "SUCCESS")]
             if self.run_slack:
-                tasks.append(self.task("slack_alert", "SUCCESS"))
-                ex["logs"].append(("slack_alert", "slack sent"))
+                child["tasks"].append(self.task("slack_alert", "SUCCESS"))
+                child["logs"].append(("slack_alert", "INFO", "slack sent"))
             state = "SUCCESS"
-        ex["tasks"], ex["state"], ex["finished"] = tasks, state, True
+        for i in range(self.children_count):
+            copy = dict(child, id=child_id if i == 0 else "%s-it%d" % (ex["id"], i))
+            self.child_execs[copy["id"]] = copy
+        ex["tasks"], ex["state"], ex["finished"] = parent_tasks, state, True
         ex["histories"].append((state, self.stamp()))
-
 
 WORK = Path(os.environ.get("TEST_DRIVER_TMP") or os.environ.get("TEMP") or ".")
 STUB = WORK / ("docker-stub-%d.py" % os.getpid())
@@ -303,9 +346,9 @@ def run_driver(fake, flow_text=SAMPLE_FLOW, extra_args=(), env=None, docker=True
     flow_file = WORK / ("flow-%d.yaml" % threading.get_ident())
     flow_file.write_text(flow_text, encoding="utf-8")
     keys = ("KESTRA_USER", "KESTRA_PASSWORD", "DRIVER_POLL_SECONDS", "GITHUB_STEP_SUMMARY", "DRIVER_DOCKER_COMMAND", "DRIVER_EXEC_TIMEOUT",
-            "STUB_MODE", "STUB_LABEL", "STUB_EVENTS")
+            "STUB_MODE", "STUB_LABEL", "STUB_EVENTS", "DRIVER_EVIDENCE_TIMEOUT")
     old = {k: os.environ.get(k) for k in keys}
-    os.environ.update({"KESTRA_USER": USER, "KESTRA_PASSWORD": PASSWORD, "DRIVER_POLL_SECONDS": "0.01", "DRIVER_EXEC_TIMEOUT": "20"})
+    os.environ.update({"KESTRA_USER": USER, "KESTRA_PASSWORD": PASSWORD, "DRIVER_POLL_SECONDS": "0.01", "DRIVER_EXEC_TIMEOUT": "20", "DRIVER_EVIDENCE_TIMEOUT": "0.4"})
     os.environ.pop("GITHUB_STEP_SUMMARY", None)
     if docker:
         os.environ["DRIVER_DOCKER_COMMAND"] = json.dumps([sys.executable, "-I", str(STUB)])
@@ -396,20 +439,159 @@ class DriverAgainstFakeKestra(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "schema 2 snapshot" in ln], out)
 
-    def test_the_slack_check_works_from_the_task_list_when_present(self):
-        code, out = run_driver(self.fake(task_list=True, run_slack=True))
+    def test_the_slack_check_works_from_the_task_list_alone(self):
+        # Slack tasks appear in the task lists but NOT in the logs (and vice versa in the next test)
+        class ListOnly(FakeKestra):
+            def finalize(self, ex):
+                super().finalize(ex)
+                for target in [ex] + list(self.child_execs.values()):
+                    target["logs"] = [row for row in target["logs"] if not row[0].startswith("slack_")]
+        fake = ListOnly(run_slack=True)
+        self.addCleanup(fake.close)
+        code, out = run_driver(fake)
         self.assertEqual(code, 1)
-        self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "no Slack task ran" in ln and "S1" in ln], out)
+        self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "no Slack task ran" in ln and "states" in ln], out)
 
+    def test_a_skipped_slack_task_is_not_a_run(self):
+        class Skipped(FakeKestra):
+            def finalize(self, ex):
+                super().finalize(ex)
+                for child in self.child_execs.values():
+                    child["tasks"].append(self.task("slack_alert", "SKIPPED"))
+        fake = Skipped()
+        self.addCleanup(fake.close)
+        code, out = run_driver(fake)
+        self.assertEqual(code, 0, out)
+
+    def test_a_failed_nested_task_is_detected_even_if_the_sub_execution_looks_fine(self):
+        class BadSave(FakeKestra):
+            def finalize(self, ex):
+                super().finalize(ex)
+                for child in self.child_execs.values():
+                    for task in child["tasks"]:
+                        if task["taskId"] == "save_snapshot":
+                            task["state"]["current"] = "FAILED"
+        fake = BadSave()
+        self.addCleanup(fake.close)
+        code, out = run_driver(fake)
+        self.assertEqual(code, 1)
+        self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "all 7 tasks ended SUCCESS" in ln and "save_snapshot" in ln], out)
     def test_an_unavailable_logs_endpoint_leaves_critical_slack_checks_unverified_and_fails_the_job(self):
-        # without logs and without a task list there is no evidence that no Slack task ran: critical, so the job must not be green
-        code, out = run_driver(self.fake(logs=False))
+        # no logs and no task lists anywhere: there is no evidence that no Slack task ran, so the critical checks must not pass
+        code, out = run_driver(self.fake(logs=False, task_list=False, child_task_list=False, child_logs=False))
         self.assertEqual(code, 1, out)
         unverified = self.statuses(out, "UNVERIFIED")
         self.assertTrue([ln for ln in unverified if "no Slack task ran" in ln], out)
         self.assertIn("::error title=Integration run not accepted::", out)
         self.assertIn("s1_slack=UNVERIFIED", out)
 
+    # ---- loop sub-executions (REGRESSIONS for run 39012658391)
+    def test_the_parent_task_list_alone_never_shows_the_nested_tasks_like_the_real_server(self):
+        fake = self.fake()
+        code, out = run_driver(fake)
+        self.assertEqual(code, 0, out)
+        parent = fake.render(fake.executions["ex01"])
+        ids = {t["taskId"] for t in parent["taskRunList"]}
+        self.assertTrue({"validate_genes", "watch_genes", "run_summary"} <= ids)
+        self.assertFalse({"read_snapshot", "compare_snapshots", "report_gene", "notify_changes", "save_snapshot"} & ids)
+        self.assertTrue([ln for ln in self.statuses(out, "PASS") if "S1 baseline: all 7 tasks ended SUCCESS (parent and loop sub-execution)" in ln], out)
+        self.assertTrue([ln for ln in self.statuses(out, "PASS") if "S3 invalid gene: the loop sub-execution ended FAILED in task compare_snapshots" in ln], out)
+
+    def test_script_output_is_read_from_the_sub_execution_logs(self):
+        code, out = run_driver(self.fake())
+        for needle in ("the baseline sent no alert", "does not recognise the query", "the logs name the different extra query"):
+            self.assertTrue([ln for ln in self.statuses(out, "PASS") if needle in ln], (needle, out))
+
+    def test_the_slack_check_must_not_pass_vacuously_when_the_sub_execution_is_invisible(self):
+        # the old driver listed no Slack tasks in the parent list and passed; with the sub-execution unreachable that is NOT evidence
+        for search in ("empty", "error", "malformed"):
+            code, out = run_driver(self.fake(search=search))
+            self.assertEqual(code, 1, (search, out))
+            self.assertEqual(self.statuses(out, "FAIL"), [], (search, out))
+            slack = [ln for ln in out.splitlines() if "no Slack task ran" in ln and ln.startswith(("PASS", "FAIL", "UNVERIFIED"))]
+            self.assertTrue(slack and all(ln.startswith("UNVERIFIED") for ln in slack), (search, slack))
+            for key in ("s1_slack", "s2_slack", "s3_slack", "s4_slack"):
+                self.assertIn(key + "=UNVERIFIED", out)
+
+    def test_an_ambiguous_number_of_sub_executions_is_unverified(self):
+        code, out = run_driver(self.fake(children_count=2))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.statuses(out, "FAIL"), [], out)
+        self.assertTrue([ln for ln in self.statuses(out, "UNVERIFIED") if "no Slack task ran" in ln and "found 2 loop sub-execution(s), expected 1" in ln], out)
+
+    def test_a_lagging_search_is_retried_until_the_sub_execution_appears(self):
+        fake = self.fake(search_lag=3)
+        code, out = run_driver(fake, env={"DRIVER_EVIDENCE_TIMEOUT": "20"})
+        self.assertEqual(code, 0, out)
+        self.assertGreater(fake.search_calls, 4)
+
+    def test_a_slack_task_in_the_sub_execution_is_detected_from_its_task_list_or_logs_alone(self):
+        for kw in ({"child_logs": False}, {"child_task_list": False}):
+            code, out = run_driver(self.fake(run_slack=True, **kw))
+            self.assertEqual(code, 1, (kw, out))
+            self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "no Slack task ran" in ln and "S1" in ln], (kw, out))
+
+    def test_slack_can_be_ruled_out_from_task_tagged_logs_when_task_lists_are_missing(self):
+        code, out = run_driver(self.fake(task_list=False, child_task_list=False))
+        self.assertEqual(self.statuses(out, "FAIL"), [], out)
+        self.assertTrue([ln for ln in self.statuses(out, "PASS") if "no Slack task ran" in ln and "task-tagged logs" in ln], out)
+        self.assertTrue([ln for ln in self.statuses(out, "UNVERIFIED") if "all 7 tasks ended SUCCESS" in ln], out)
+
+    def test_missing_nested_task_states_are_unverified_not_failed(self):
+        # the old driver FAILED "all 7 tasks SUCCESS" because the nested tasks were missing from the parent list
+        code, out = run_driver(self.fake(child_task_list=False))
+        self.assertEqual(self.statuses(out, "FAIL"), [], out)
+        self.assertTrue([ln for ln in self.statuses(out, "UNVERIFIED") if "all 7 tasks ended SUCCESS" in ln], out)
+
+    def test_script_text_missing_from_complete_evidence_is_a_failure_but_from_partial_evidence_unverified(self):
+        class Quiet(FakeKestra):
+            def finalize(self, ex):
+                super().finalize(ex)
+                for child in self.child_execs.values():
+                    child["logs"] = [(t, lv, "nothing useful") for t, lv, _ in child["logs"]]
+        fake = Quiet()
+        self.addCleanup(fake.close)
+        code, out = run_driver(fake)
+        self.assertEqual(code, 1)
+        self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "does not recognise the query" in ln], out)
+        code, out = run_driver(self.fake(child_logs=False))
+        self.assertEqual(self.statuses(out, "FAIL"), [], out)
+        self.assertTrue([ln for ln in self.statuses(out, "UNVERIFIED") if "does not recognise the query" in ln], out)
+
+    def test_a_sub_execution_that_ended_in_the_wrong_state_is_detected(self):
+        class WrongState(FakeKestra):
+            def finalize(self, ex):
+                super().finalize(ex)
+                for child in self.child_execs.values():
+                    child["state"] = "SUCCESS" if child["state"] == "FAILED" else "FAILED"
+        fake = WrongState()
+        self.addCleanup(fake.close)
+        code, out = run_driver(fake)
+        self.assertEqual(code, 1)
+        self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "the loop sub-execution ended" in ln], out)
+    def test_diagnostics_report_task_ids_states_log_groups_and_sub_execution_structure(self):
+        code, out = run_driver(self.fake())
+        info = "\n".join(self.statuses(out, "INFO"))
+        self.assertIn("S1 baseline diagnostics: parent taskRunList -- validate_genes=SUCCESS, watch_genes=SUCCESS, run_summary=SUCCESS", info)
+        self.assertIn("parent logs by taskId/level -- run_summary/INFO=1", info)
+        self.assertIn("execution search kind=LOOP parentId=ex01 -- 1 row(s); row keys", info)
+        self.assertIn("sub-execution ex01-it0", info)
+        self.assertIn("kind=LOOP state=SUCCESS parentId=ex01", info)
+        self.assertIn("compare_snapshots/INFO=3", info)
+        self.assertIn("S3 invalid gene diagnostics: sub-execution", info)
+        self.assertIn("compare_snapshots=FAILED", info)
+
+    def test_diagnostics_never_print_log_bodies_or_credentials(self):
+        class Leaky(FakeKestra):
+            def finalize(self, ex):
+                super().finalize(ex)
+                for target in [ex] + list(self.child_execs.values()):
+                    target["logs"] = [(t, lv, m + " https://hooks.slack.com/services/T000/B000/SECRETWEBHOOK api_key=LEAKEDKEY123") for t, lv, m in target["logs"]]
+        fake = Leaky()
+        self.addCleanup(fake.close)
+        code, out = run_driver(fake)
+        for leaked in ("SECRETWEBHOOK", "LEAKEDKEY123", "hooks.slack.com"):
+            self.assertNotIn(leaked, out)
     def test_every_unverified_result_emits_a_github_warning_annotation(self):
         code, out = run_driver(self.fake(logs=False))
         unverified = self.statuses(out, "UNVERIFIED")
@@ -734,6 +916,19 @@ class Helpers(unittest.TestCase):
             self.assertEqual(buffer.getvalue().count("***"), 3)
         finally:
             driver.SECRETS.clear()
+    def test_sensitive_patterns_are_scrubbed_even_without_a_registered_secret(self):
+        driver.SECRETS.clear()
+        samples = {
+            "https://hooks.slack.com/services/T000/B000/XXXXXXXX": "XXXXXXXX",
+            "NCBI api_key=abcdef123456 used": "abcdef123456",
+            "password: hunter2hunter2": "hunter2hunter2",
+            "Authorization: Basic Y2lAZXhhbXBsZS5jb206U2VjcmV0MTIz": "Y2lAZXhhbXBsZS5jb206U2VjcmV0MTIz",
+            "header Bearer eyJhbGciOiJIUzI1NiJ9.payload": "eyJhbGciOiJIUzI1NiJ9",
+            "token=tok_live_999": "tok_live_999",
+        }
+        for text, secret in samples.items():
+            self.assertNotIn(secret, driver.redact(text), text)
+        self.assertEqual(driver.redact("S1 baseline: all 7 tasks ended SUCCESS"), "S1 baseline: all 7 tasks ended SUCCESS")
     def test_time_parsing_accepts_nanosecond_style_timestamps(self):
         self.assertIsNotNone(driver.parse_time("2026-10-17T05:56:08.123456789Z"))
         self.assertIsNone(driver.parse_time("not a date"))
