@@ -44,14 +44,28 @@ tasks:
 """
 
 
+GALLERY_BLOCK = """
+extend:
+  title: Gallery title
+  description: |
+    Markdown with a line that looks like
+    extend: nothing
+  tags:
+    - a
+    - b
+"""
+# a nested key named `extend` must survive stripping
+SAMPLE_WITH_EXTEND = SAMPLE_FLOW.replace("    message: hi\n", "    message: hi\n    extend: nested-and-kept\n") + GALLERY_BLOCK
+
+
 class FakeKestra:
     """Imitates the Kestra endpoints the driver uses. Behaviour switches let tests inject faults."""
 
     def __init__(self, version="2.0.6", prefix="/api/v1/main", enforce_concurrency=True, logs=True, run_slack=False,
                  tamper_kv_on_failure=False, flow_validation_error=False, stall=False, task_list=False, outputs=False,
-                 configs=True, task_ids_in_logs=True, empty_kv_after_baseline=False):
+                 configs=True, task_ids_in_logs=True, empty_kv_after_baseline=False, label=None):
         # Kestra 2.0 execution JSON carries no task outputs, so the fake omits them by default (outputs=True adds them, task_list=True adds states)
-        self.task_list, self.outputs, self.configs = task_list, outputs, configs
+        self.task_list, self.outputs, self.configs, self.label = task_list, outputs, configs, label
         self.task_ids_in_logs, self.empty_kv_after_baseline = task_ids_in_logs, empty_kv_after_baseline
         self.version, self.prefix, self.stall = version, prefix, stall
         self.enforce_concurrency, self.logs_enabled, self.run_slack = enforce_concurrency, logs, run_slack
@@ -105,14 +119,25 @@ class FakeKestra:
             if path == "/api/v1/configs" or path == self.prefix + "/configs":
                 if not self.configs:
                     return self.send(h, 404, {})
+                if self.configs == "malformed":
+                    return self.send(h, 200, b"<html>not json</html>")
+                if self.configs == "noversion":
+                    return self.send(h, 200, {"edition": "OSS"})
+                if self.configs == "nonstring":
+                    return self.send(h, 200, {"version": 206})
                 return self.send(h, 200, {"version": self.version})
             if not self.authorised(h):
                 return self.send(h, 401, {"message": "Unauthorized"})
             p = self.prefix
             if method == "GET" and path == p + "/flows/search":
                 return self.send(h, 200, {"results": [], "total": 0})
+            gallery = re.search(rb"^extend:", body, re.M) is not None
             if method == "POST" and path == p + "/flows/validate":
+                if gallery:
+                    return self.send(h, 200, [{"index": 0, "constraints": 'Validation error: Unrecognized field "extend"'}])
                 return self.send(h, 200, [{"constraints": "tasks: bad" if self.flow_validation_error else None}])
+            if method == "POST" and path == p + "/flows" and gallery:
+                return self.send(h, 422, {"title": "Validation failed", "detail": 'Unrecognized field "extend"'})
             if method == "POST" and path == p + "/flows":
                 ns = re.search(rb"^namespace:\s*(\S+)", body, re.M).group(1).decode()
                 fid = re.search(rb"^id:\s*(\S+)", body, re.M).group(1).decode()
@@ -404,16 +429,65 @@ class DriverAgainstFakeKestra(unittest.TestCase):
         self.assertTrue([ln for ln in self.statuses(out, "UNVERIFIED") if "the server is Kestra 2.0.x" in ln], out)
         self.assertIn("version=UNVERIFIED", out)
 
-    def test_the_image_label_alone_can_establish_the_version(self):
-        code, out = run_driver(self.fake(configs=False))
+    def test_a_nightly_image_label_with_a_2_0_6_config_endpoint_passes(self):
+        # REGRESSION (run 39011785668): the real image label said "nightly" while /configs said 2.0.6
+        code, out = run_driver(self.fake(), env={"STUB_LABEL": "nightly"})
         self.assertEqual(code, 0, out)
-        self.assertTrue([ln for ln in self.statuses(out, "PASS") if "the server is Kestra 2.0.x" in ln and "image label" in ln], out)
+        self.assertTrue([ln for ln in self.statuses(out, "PASS") if "the server is Kestra 2.0.x" in ln and "'2.0.6'" in ln], out)
+        self.assertTrue([ln for ln in self.statuses(out, "INFO") if "image label" in ln and "nightly" in ln], out)
 
-    def test_a_contradicting_image_label_fails(self):
-        code, out = run_driver(self.fake(), env={"STUB_LABEL": "1.3.43"})
+    def test_an_image_label_never_decides_the_version_check(self):
+        for label in ("1.3.43", "2.0.6", "nightly", "<no value>", ""):
+            code, out = run_driver(self.fake(), env={"STUB_LABEL": label})
+            self.assertEqual(code, 0, (label, out))
+            self.assertEqual(self.statuses(out, "FAIL"), [], (label, out))
+
+    def test_an_incompatible_config_version_fails_whatever_the_label_says(self):
+        for version in ("1.3.43", "2.1.0", "3.0.0", "20.0.6", "2.0", "2.0.", "2.0.x", "nightly", "v1.0.0"):
+            code, out = run_driver(self.fake(version=version), env={"STUB_LABEL": "2.0.6"})
+            self.assertEqual(code, 1, (version, out))
+            self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "the server is Kestra 2.0.x" in ln], (version, out))
+
+    def test_release_style_config_versions_are_accepted(self):
+        for version in ("2.0.0", "2.0.6", "v2.0.12", "2.0.7-rc1", "2.0.6+build.5"):
+            code, out = run_driver(self.fake(version=version))
+            self.assertEqual(code, 0, (version, out))
+
+    def test_a_missing_or_malformed_config_endpoint_never_produces_a_pass(self):
+        for configs in (False, "malformed", "noversion", "nonstring"):
+            for label in ("2.0.6", None):
+                env = {"STUB_LABEL": label} if label else {"STUB_MODE": "broken"}
+                code, out = run_driver(self.fake(configs=configs), env=env)
+                self.assertEqual(code, 1, (configs, label, out))
+                self.assertEqual([ln for ln in self.statuses(out, "PASS") if "the server is Kestra" in ln], [], (configs, label, out))
+                self.assertIn("version=UNVERIFIED", out)
+
+    def test_an_absent_image_label_changes_nothing(self):
+        code, out = run_driver(self.fake(), docker=False)
+        self.assertTrue([ln for ln in self.statuses(out, "PASS") if "the server is Kestra 2.0.x" in ln], out)
+        self.assertTrue([ln for ln in self.statuses(out, "INFO") if "image label" in ln and "absent" in ln], out)
+
+    def test_the_gallery_metadata_is_stripped_before_deployment_and_the_run_is_accepted(self):
+        # REGRESSION (run 39011785668): Kestra rejected the top-level extend: block
+        fake = self.fake()
+        code, out = run_driver(fake, flow_text=SAMPLE_WITH_EXTEND)
+        self.assertEqual(code, 0, out)
+        deployed = next(iter(fake.flows.values()))
+        self.assertNotRegex(deployed, r"(?m)^extend:")
+        self.assertIn("extend: nested-and-kept", deployed)
+        self.assertEqual(yaml.safe_load(deployed)["tasks"][0]["extend"], "nested-and-kept")
+        self.assertTrue([ln for ln in self.statuses(out, "PASS") if "Kestra validates the flow YAML" in ln], out)
+
+    def test_without_stripping_the_fake_rejects_the_flow_like_the_real_server(self):
+        fake = self.fake()
+        original = driver.strip_gallery_metadata
+        driver.strip_gallery_metadata = lambda text: (text, 0)
+        try:
+            code, out = run_driver(fake, flow_text=SAMPLE_WITH_EXTEND)
+        finally:
+            driver.strip_gallery_metadata = original
         self.assertEqual(code, 1)
-        self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "the server is Kestra 2.0.x" in ln], out)
-
+        self.assertTrue([ln for ln in self.statuses(out, "FAIL") if "the flow is created" in ln], out)
     def test_missing_docker_runner_evidence_fails_the_job(self):
         code, out = run_driver(self.fake(), docker=False)
         self.assertEqual(code, 1, out)
@@ -523,6 +597,88 @@ class Helpers(unittest.TestCase):
         self.assertEqual(len(after), len(before) + 1)
         self.assertEqual([ln for ln in after if ln not in before], ["    disabled: true"])
         self.assertEqual(yaml.safe_load(out)["triggers"][0]["disabled"], True)
+
+    def test_stripping_removes_only_the_top_level_extend_block(self):
+        stripped, removed = driver.strip_gallery_metadata(SAMPLE_WITH_EXTEND)
+        self.assertGreater(removed, 5)
+        before, after = yaml.safe_load(SAMPLE_WITH_EXTEND), yaml.safe_load(stripped)
+        self.assertIn("extend", before)
+        self.assertNotIn("extend", after)
+        before.pop("extend")
+        self.assertEqual(before, after, "everything except the top-level extend key is preserved")
+        self.assertEqual(after["tasks"][0]["extend"], "nested-and-kept", "a nested key named extend survives")
+        self.assertEqual(stripped, SAMPLE_FLOW.replace("    message: hi\n", "    message: hi\n    extend: nested-and-kept\n"), "the remaining text is byte-identical")
+
+    def test_content_after_the_extend_block_is_preserved(self):
+        text = SAMPLE_FLOW + "extend:\n  title: t\n\n# trailing comment\nafter: 1\n"
+        stripped, _ = driver.strip_gallery_metadata(text)
+        self.assertEqual(yaml.safe_load(stripped)["after"], 1)
+        self.assertNotIn("extend", yaml.safe_load(stripped))
+        self.assertIn("# trailing comment", stripped)
+    def test_a_flow_without_extend_is_returned_unchanged(self):
+        self.assertEqual(driver.strip_gallery_metadata(SAMPLE_FLOW), (SAMPLE_FLOW, 0))
+
+    def test_two_top_level_extend_keys_are_refused(self):
+        with self.assertRaises(ValueError):
+            driver.strip_gallery_metadata(SAMPLE_WITH_EXTEND + "extend:\n  x: 1\n")
+
+    def test_text_that_merely_mentions_extend_is_not_stripped(self):
+        text = SAMPLE_FLOW.replace("message: hi", "message: |\n      extend: inside a block scalar\n      extended: no")
+        self.assertEqual(driver.strip_gallery_metadata(text), (text, 0))
+        self.assertEqual(driver.strip_gallery_metadata(text.replace("tasks:", "extended: 1\ntasks:"))[1], 0)
+
+    def test_the_deployment_copy_keeps_identity_inputs_tasks_and_has_the_disabled_trigger(self):
+        flow = SAMPLE_WITH_EXTEND.replace("tasks:", "inputs:\n  - id: genes\n    type: JSON\n    defaults: '[\"MAX\"]'\n\ntasks:", 1)
+        deployed, removed = driver.prepare_deployment(flow)
+        before, after = yaml.safe_load(flow), yaml.safe_load(deployed)
+        self.assertEqual(driver.flow_identity(deployed), driver.flow_identity(flow))
+        for key in ("id", "namespace", "inputs", "tasks"):
+            self.assertEqual(before[key], after[key])
+        self.assertIs(after["triggers"][0]["disabled"], True)
+        after["triggers"][0].pop("disabled")
+        before.pop("extend")
+        self.assertEqual(before, after)
+        self.assertEqual(sorted(set(after) ^ set(yaml.safe_load(flow))), ["extend"])
+
+    def test_the_original_flow_text_is_never_modified(self):
+        original = SAMPLE_WITH_EXTEND
+        copy = str(original)
+        driver.prepare_deployment(original)
+        self.assertEqual(original, copy)
+
+    def test_the_driver_never_writes_the_flow_file(self):
+        flow_file = WORK / "flow-readonly-check.yaml"
+        flow_file.write_text(SAMPLE_WITH_EXTEND, encoding="utf-8", newline="")
+        before = flow_file.read_bytes()
+        fake = FakeKestra()
+        try:
+            old = {k: os.environ.get(k) for k in ("KESTRA_USER", "KESTRA_PASSWORD", "DRIVER_POLL_SECONDS", "DRIVER_DOCKER_COMMAND")}
+            os.environ.update({"KESTRA_USER": USER, "KESTRA_PASSWORD": PASSWORD, "DRIVER_POLL_SECONDS": "0.01",
+                               "DRIVER_DOCKER_COMMAND": json.dumps([sys.executable, "-I", str(STUB)])})
+            with redirect_stdout(io.StringIO()):
+                driver.main(["--flow", str(flow_file), "--base-url", fake.url, "--startup-timeout", "5"])
+        finally:
+            fake.close()
+            driver.SECRETS.clear()
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+        self.assertEqual(flow_file.read_bytes(), before)
+        flow_file.unlink(missing_ok=True)
+
+    @unittest.skipUnless(os.environ.get("CLINVAR_FLOW"), "CLINVAR_FLOW not set")
+    def test_the_real_flow_deployment_copy_differs_only_by_extend_and_the_disabled_line(self):
+        raw = Path(os.environ["CLINVAR_FLOW"]).read_bytes()
+        text = raw.decode("utf-8").replace("\r\n", "\n")
+        deployed, removed = driver.prepare_deployment(text)
+        before, after = yaml.safe_load(text), yaml.safe_load(deployed)
+        self.assertIn("extend", before)
+        self.assertNotIn("extend", after)
+        self.assertGreater(removed, 5)
+        self.assertIs(after["triggers"][0].pop("disabled"), True)
+        before.pop("extend")
+        self.assertEqual(before, after, "tasks, inputs, errors, triggers and every other key are preserved")
+        self.assertEqual(driver.flow_identity(deployed), ("company.team", "clinvar-variant-reclassification-monitor"))
+        self.assertEqual(Path(os.environ["CLINVAR_FLOW"]).read_bytes(), raw)
 
     def test_the_transformation_refuses_a_flow_without_exactly_one_schedule_trigger(self):
         with self.assertRaises(ValueError):

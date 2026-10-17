@@ -24,8 +24,8 @@ Result handling (strict):
     visible run, so a run that passes the critical checks but could confirm almost nothing else is still rejected.
   * Any FAIL also fails the job.
 
-Scenarios (all with notify_slack=false and the small gene MAX; the flow is deployed unchanged except that its weekly schedule trigger
-is disabled in the copy sent to Kestra):
+Scenarios (all with notify_slack=false and the small gene MAX; the copy sent to Kestra has the Blueprints-gallery `extend:` block removed
+(Kestra rejects it) and its weekly schedule trigger disabled; the flow file itself is never written):
   S1 baseline run   S2 incremental run   S3 invalid gene fails   S4 changed extra query fails   S5 two executions at once
 """
 import argparse
@@ -204,6 +204,30 @@ def disable_trigger(flow_text):
     return text.replace(TRIGGER_MARKER, TRIGGER_MARKER + "    disabled: true\n")
 
 
+def strip_gallery_metadata(flow_text):
+    """Remove the top-level `extend:` block (Blueprints-gallery metadata that Kestra's flow model rejects). Only a column-0 `extend:` key
+    and the indented or blank lines that follow it are removed; a nested key named `extend` is never touched."""
+    lines = flow_text.replace("\r\n", "\n").split("\n")
+    starts = [i for i, ln in enumerate(lines) if re.match(r"extend:(\s|$)", ln)]
+    if len(starts) > 1:
+        raise ValueError("expected at most one top-level extend: key, found %d" % len(starts))
+    if not starts:
+        return "\n".join(lines), 0
+    start = starts[0]
+    end = start + 1
+    while end < len(lines) and (lines[end] == "" or lines[end][0] in " \t"):
+        end += 1
+    while start > 0 and lines[start - 1] == "":
+        start -= 1  # drop the blank separator line(s) in front of the block
+    kept = lines[:start] + lines[end:]
+    return "\n".join(kept).rstrip("\n") + "\n", end - start
+
+
+def prepare_deployment(flow_text):
+    """The deployment copy: gallery metadata stripped, weekly trigger disabled. The file on disk is never written."""
+    stripped, removed = strip_gallery_metadata(flow_text)
+    return disable_trigger(stripped), removed
+
 def flow_identity(flow_text):
     ns = re.search(r"^namespace:\s*(\S+)\s*$", flow_text, re.M)
     fid = re.search(r"^id:\s*(\S+)\s*$", flow_text, re.M)
@@ -283,22 +307,26 @@ class Driver:
         return False
 
     def check_version(self, expected_prefix, container):
-        """Critical. Evidence: the configs endpoint and/or the image label of the running container. Any contradiction is a FAIL."""
-        sources = {}
+        """Critical. The configs endpoint is the ONLY authoritative source. The image label is informational: the official image
+        labels itself "nightly" even for release tags, so it is never a PASS and never a contradiction."""
+        name = "the server is Kestra %sx" % expected_prefix
+        reported, problem = None, "the configs endpoint did not answer with HTTP 200 and a JSON object"
         for path in (self.client.prefix + "/configs", "/api/v1/configs"):
             status, data, _ = self.client.json("GET", path)
-            if status == 200 and isinstance(data, dict) and data.get("version"):
-                sources["API " + path] = str(data["version"])
-                break
+            if status == 200 and isinstance(data, dict):
+                value = data.get("version")
+                if isinstance(value, str) and value.strip():
+                    reported = value.strip()
+                    break
+                problem = "the configs endpoint answered without a usable string 'version' field"
         label = docker(["inspect", container, "--format", '{{index .Config.Labels "org.opencontainers.image.version"}}'])
-        if label and label.strip() and label.strip() != "<no value>":
-            sources["image label"] = label.strip()
-        if not sources:
-            self.report.unverified("the server is Kestra %sx" % expected_prefix, "neither the configs endpoint nor the image label could be read", key="version")
+        label = (label or "").strip()
+        self.report.info("image label org.opencontainers.image.version (informational only, never a version proof)", label if label and label != "<no value>" else "absent")
+        if reported is None:
+            self.report.unverified(name, problem, key="version")
             return
-        ok = all(v.lstrip("v").startswith(expected_prefix) for v in sources.values())
-        self.report.check("the server is Kestra %sx" % expected_prefix, ok, "; ".join("%s = %s" % kv for kv in sources.items()), key="version")
-
+        release = re.fullmatch(re.escape(expected_prefix) + r"\d+(?:[-+][0-9A-Za-z.-]+)?", reported.lstrip("v"))
+        self.report.check(name, bool(release), "configs endpoint reports %r" % reported, key="version")
     def docker_evidence(self, since, image):
         """Critical. The Docker daemon itself records which containers were created from the flow's image during the run."""
         until = int(time.time()) + 1
@@ -622,8 +650,8 @@ def main(argv=None):
     started_at = time.time()
     try:
         flow_text = Path(args.flow).read_text(encoding="utf-8")
-        deployed = disable_trigger(flow_text)
-        report.info("the flow is deployed unchanged except for one added line", "'disabled: true' on the schedule trigger; %d -> %d lines" % (flow_text.count("\n"), deployed.count("\n")))
+        deployed, removed = prepare_deployment(flow_text)
+        report.info("deployment copy differs from the flow file in two ways only", "top-level extend: block removed (%d lines, gallery metadata) and 'disabled: true' added to the schedule trigger; %d -> %d lines" % (removed, flow_text.count("\n"), deployed.count("\n")))
         if not driver.wait_for_server(args.startup_timeout):
             report.check("the Kestra server became ready", False, "no authenticated API answer within %ds" % args.startup_timeout)
         else:
