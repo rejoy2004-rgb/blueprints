@@ -1,0 +1,151 @@
+name: Kestra integration (real server)
+
+# Fork-only integration test of the ClinVar Variant Reclassification Monitor on a REAL Kestra 2.0.x server.
+#
+# NEVER include this file or ci/ in the upstream pull request: kestra-io/blueprints closes PRs that touch files outside flows/.
+# Publish it ONLY as the root (orphan, parentless) commit of the fork branch ci/kestra-integration. A push to that branch triggers it.
+#
+# What happens: the job starts the official Kestra image (pinned by digest) on the runner, deploys the flow from the feature branch
+# through Kestra's REST API, and runs five scenarios with notify_slack=false on the small gene MAX. The server is thrown away with
+# the runner. No repository secret is used and none is defined on the throwaway server, so no Slack message can be sent.
+# The flow makes a handful of read-only requests to NCBI E-utilities (about 15 for the gene MAX).
+
+on:
+  push:
+    branches:
+      - ci/kestra-integration
+  workflow_dispatch:
+    inputs:
+      flow_ref:
+        description: Branch or tag of this repository that holds flows/clinvar-variant-reclassification-monitor.yaml
+        required: false
+        default: feat/clinvar-variant-reclassification-monitor
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kestra-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  KESTRA_IMAGE: kestra/kestra:v2.0.6@sha256:bc2e8b5c639c3ff1f7ba9c1aadef4686a87669895a1d80c23d01c58d45785914
+  # python:3.12-slim resolved from registry metadata on 2026-10-17: index digest below; its linux/amd64 platform manifest is
+  # sha256:2b4f19dae3a777dfc3b76730bda1e82e1f66ab2a2686fa93ca78edbfb4f04ffe (PYTHON_VERSION=3.12.15). The flow asks for the tag
+  # python:3.12-slim, so the verified digest is pulled and tagged locally under that name before Kestra starts.
+  FLOW_IMAGE: python:3.12-slim
+  FLOW_IMAGE_PINNED: python@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
+  # The only flow commit this job may test (feature branch commit f530d0a). Any other commit stops the job.
+  EXPECTED_FLOW_SHA: f530d0a8aaa54f2ac12d59d3b8089bcbc0abb527
+  # Documented minimum number of PASS results (see ci/kestra_integration/run_integration.py).
+  MIN_PASS: "30"
+
+jobs:
+  integration:
+    name: ClinVar flow on Kestra 2.0.6 with the Docker task runner
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the CI files (this branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the flow under test (read-only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.flow_ref || 'feat/clinvar-variant-reclassification-monitor' }}
+          path: flow-under-test
+          persist-credentials: false
+
+      - name: Assert the flow commit under test is exactly the reviewed one
+        run: |
+          actual="$(git -C flow-under-test rev-parse HEAD)"
+          echo "flow commit under test: $actual"
+          echo "expected flow commit:   $EXPECTED_FLOW_SHA"
+          if [ "$actual" != "$EXPECTED_FLOW_SHA" ]; then
+            echo "::error title=Wrong flow commit::the checked-out flow commit differs from the reviewed commit; stopping"
+            exit 1
+          fi
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML (used only by the driver's own unit tests)
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: "pyyaml==6.0.3"
+
+      - name: Unit tests of the driver (fake Kestra API on loopback, no external network)
+        env:
+          CLINVAR_FLOW: flow-under-test/flows/clinvar-variant-reclassification-monitor.yaml
+        run: python -I ci/kestra_integration/test_run_integration.py
+
+      - name: Pull the pinned images
+        run: |
+          docker pull "$KESTRA_IMAGE"
+          docker pull "$FLOW_IMAGE_PINNED"
+          platform="$(docker image inspect "$FLOW_IMAGE_PINNED" --format '{{.Os}}/{{.Architecture}}')"
+          echo "flow task image platform: $platform"
+          if [ "$platform" != "linux/amd64" ]; then
+            echo "::error title=Wrong image platform::expected linux/amd64"
+            exit 1
+          fi
+          docker tag "$FLOW_IMAGE_PINNED" "$FLOW_IMAGE"
+          docker image inspect "$FLOW_IMAGE" --format 'flow task image {{index .RepoDigests 0}}'
+
+      - name: Start Kestra with throwaway credentials
+        run: |
+          password="Ci1$(openssl rand -hex 16)"
+          b64_password="$(printf '%s' "$password" | base64 -w0)"
+          b64_basic="$(printf '%s' "ci@example.com:$password" | base64 -w0)"
+          echo "::add-mask::$password"
+          echo "::add-mask::$b64_password"
+          echo "::add-mask::$b64_basic"
+          echo "KESTRA_USER=ci@example.com" >> "$GITHUB_ENV"
+          echo "KESTRA_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "KESTRA_PASSWORD_B64=$b64_password" >> "$GITHUB_ENV"
+          echo "KESTRA_BASIC_B64=$b64_basic" >> "$GITHUB_ENV"
+          mkdir -p /tmp/kestra-wd/tmp
+          config="$(cat <<EOF
+          kestra:
+            anonymous-usage-report:
+              enabled: false
+            ui-anonymous-usage-report:
+              enabled: false
+            server:
+              basic-auth:
+                username: ci@example.com
+                password: $password
+            tasks:
+              tmp-dir:
+                path: /tmp/kestra-wd/tmp
+          EOF
+          )"
+          docker run -d --name kestra --user root \
+            -p 127.0.0.1:8080:8080 \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /tmp/kestra-wd:/tmp/kestra-wd \
+            -e KESTRA_CONFIGURATION="$config" \
+            "$KESTRA_IMAGE" server local
+
+      - name: Run the five scenarios through the REST API
+        run: >
+          python ci/kestra_integration/run_integration.py
+          --flow flow-under-test/flows/clinvar-variant-reclassification-monitor.yaml
+          --base-url http://127.0.0.1:8080
+          --gene MAX
+          --container kestra
+          --flow-image "$FLOW_IMAGE"
+          --min-pass "$MIN_PASS"
+
+      - name: Kestra server log (errors and warnings only, credentials redacted)
+        if: always()
+        run: |
+          docker logs kestra 2>&1 | sed -e "s|$KESTRA_PASSWORD|***|g" -e "s|$KESTRA_PASSWORD_B64|***|g" -e "s|$KESTRA_BASIC_B64|***|g" | grep -E ' (ERROR|WARN) ' | tail -n 80 || true
+
+      - name: Stop Kestra
+        if: always()
+        run: docker rm -f kestra || true
