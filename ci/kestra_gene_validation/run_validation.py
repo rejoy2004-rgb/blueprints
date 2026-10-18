@@ -307,6 +307,7 @@ def tasks_by_id(execution):
 class Driver:
     def __init__(self, client, report, poll):
         self.client, self.report, self.poll = client, report, poll
+        self.default_prefix = None  # the state_key_prefix input default, read from the candidate in run_all
         self.executed = []  # every (namespace, flow id) an execution was started for: the full candidate must never appear here
 
     def wait_for_server(self, timeout):
@@ -492,22 +493,46 @@ class Driver:
         else:
             self.report.check(name, sorted(seen) == expected and all(KV_RULE.fullmatch(s) for s in seen), "keys %s" % sorted(seen), key=key)
 
+    def used_key(self, execution):
+        """The KV key the execution's read_snapshot task printed (KEYCHECK), or None when it cannot be read."""
+        kids = self.settle_children(execution["id"], 1)
+        if not kids or len(kids) != 1:
+            return None
+        found = [m.group(1) for r in (self.logs(kids[0]["id"]) or []) for m in [re.match(r"KEYCHECK (\S*)$", str(r.get("message", "")).strip())] if m]
+        return found[0] if len(found) == 1 else None
+
     def prefix_case(self, prefix, valid):
+        """Every prefix case records the key the run actually used. The empty string is a special case: Kestra may reject it, replace it
+        with the input's default, or run with a truly empty prefix; only the last is a failure, and it is told apart by the recorded key."""
         key = "prefix %s %r" % ("valid" if valid else "invalid", prefix)
         execution, status, data = self.run_case(["MAX"], prefix)
+        used = self.used_key(execution) if execution is not None and state_of(execution) == "SUCCESS" else None
+        if prefix == "" or valid:
+            self.report.info("prefix %r: observed" % prefix, "HTTP %s, state %s, KV key used: %r" % (status, state_of(execution), used))
         if valid:
-            self.report.check("prefix %r is accepted and the run succeeds" % prefix, execution is not None and state_of(execution) == "SUCCESS",
-                              "HTTP %s, state %s" % (status, state_of(execution)), key=key)
+            expected = "%s_max" % prefix
+            ok = execution is not None and state_of(execution) == "SUCCESS" and used == expected and KV_RULE.fullmatch(used) is not None
+            self.report.check("prefix %r is accepted, the run succeeds and the key is %r" % (prefix, expected), ok,
+                              "HTTP %s, state %s, key %r" % (status, state_of(execution), used), key=key)
             return
         if execution is None:
             self.report.check("prefix %r is rejected when the execution is created" % prefix, status is not None and 400 <= status < 500, "HTTP %s %s" % (status, snippet(data)), key=key)
             return
         tasks = tasks_by_id(execution)
+        if prefix == "" and state_of(execution) == "SUCCESS":
+            name = "prefix '' (empty value) never runs with an empty prefix: it is replaced by the input default %r" % self.default_prefix
+            if used is None:
+                self.report.unverified(name, "the key the run used could not be read", key=key)
+            else:
+                expected = "%s_max" % self.default_prefix
+                self.report.check(name, used == expected and KV_RULE.fullmatch(used) is not None, "observed key %r (default substituted: %s)" % (used, used == expected), key=key)
+            return
         self.report.check("prefix %r is rejected before any task runs" % prefix, state_of(execution) == "FAILED" and tasks is not None and not tasks,
-                          "state %s, task runs %s" % (state_of(execution), sorted(tasks or {})), key=key)
+                          "state %s, task runs %s, key used %r" % (state_of(execution), sorted(tasks or {}), used), key=key)
 
     def run_all(self, candidate_text, expected_prefix):
         self.check_version(expected_prefix)
+        self.default_prefix = next(i for i in yaml.safe_load(candidate_text)["inputs"] if i["id"] == "state_key_prefix")["defaults"]
         deploy_text = disable_trigger(strip_gallery_metadata(candidate_text))
         self.report.info("the full candidate is deployed only to be validated and created, never executed",
                          "gallery extend: block removed and 'disabled: true' added to the schedule trigger; %d -> %d lines" % (candidate_text.count("\n"), deploy_text.count("\n")))

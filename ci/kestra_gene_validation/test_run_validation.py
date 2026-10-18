@@ -39,7 +39,8 @@ class FakeKestra:
     """Behaviour switches inject the faults the driver must catch."""
 
     def __init__(self, version="2.0.6", flip=(), leak=False, prefix_check=True, refuse_empty=False, validate_error=False, search="ok", logs=True,
-                 wrong_probe=None):
+                 wrong_probe=None, empty_prefix="default", keycheck_override=None):
+        self.empty_prefix, self.keycheck_override = empty_prefix, keycheck_override
         self.version, self.flip, self.leak, self.prefix_check, self.refuse_empty = version, [json.dumps(g) for g in flip], leak, prefix_check, refuse_empty
         self.validate_error, self.search, self.logs_on, self.wrong_probe = validate_error, search, logs, wrong_probe
         self.flows, self.executions, self.children, self.requests = {}, {}, {}, 0
@@ -131,7 +132,11 @@ class FakeKestra:
             return self.send(h, 404, {})
         genes, prefix = json.loads(fields["genes"]), fields.get("state_key_prefix", "")
         inputs = {i["id"]: i for i in flow["inputs"]}
-        if self.prefix_check and re.search(inputs["state_key_prefix"]["validator"], prefix) is None:
+        if prefix == "" and self.empty_prefix == "reject":
+            return self.send(h, 422, {"detail": "state_key_prefix is empty"})
+        if prefix == "" and self.empty_prefix == "default":
+            prefix = inputs["state_key_prefix"]["defaults"]   # an empty form value is replaced by the input default
+        if self.prefix_check and not (prefix == "" and self.empty_prefix == "empty") and re.search(inputs["state_key_prefix"]["validator"], prefix) is None:
             return self.send(h, 422, {"detail": "invalid state_key_prefix"})
         if self.refuse_empty and not genes:
             return self.send(h, 422, {"detail": "genes is required"})
@@ -158,7 +163,7 @@ class FakeKestra:
                 cid = "%s-c%d" % (eid, len(self.children))
                 self.children[cid] = {"parentId": eid, "json": {"id": cid, "kind": "LOOP", "parentId": eid, "state": {"current": "SUCCESS"},
                                                                  "taskRunList": [{"taskId": "read_snapshot", "state": {"current": "SUCCESS"}}]},
-                                      "logs": [{"message": "KEYCHECK %s_%s" % (prefix, gene.strip().lower()), "taskId": "read_snapshot"}]}
+                                      "logs": [{"message": "KEYCHECK %s_%s" % (self.keycheck_override or prefix, gene.strip().lower()), "taskId": "read_snapshot"}]}
         self.executions[eid] = {"json": {"id": eid, "state": {"current": state}, "taskRunList": runs}, "logs": logs}
         return self.send(h, 200, {"id": eid})
 
@@ -308,6 +313,39 @@ class DriverTests(unittest.TestCase):
         code, out = run_main(self.fake(refuse_empty=True))
         self.assertEqual(code, 0, out)
         self.assertTrue([ln for ln in self.lines(out, "INFO") if "refused the empty list" in ln and "not exercised" in ln], out)
+
+    def test_an_empty_prefix_replaced_by_the_default_is_verified_through_the_recorded_key(self):
+        code, out = run_main(self.fake(empty_prefix="default"))
+        self.assertEqual(code, 0, out)
+        self.assertTrue([ln for ln in self.lines(out, "PASS") if "prefix \x27\x27 (empty value) never runs with an empty prefix" in ln and "clinvar_snapshot_max" in ln], out)
+        self.assertTrue([ln for ln in self.lines(out, "INFO") if "prefix \x27\x27: observed" in ln and "KV key used: \x27clinvar_snapshot_max\x27" in ln], out)
+
+    def test_an_empty_prefix_rejected_by_kestra_passes(self):
+        code, out = run_main(self.fake(empty_prefix="reject"))
+        self.assertEqual(code, 0, out)
+        self.assertTrue([ln for ln in self.lines(out, "PASS") if "prefix \x27\x27 is rejected when the execution is created" in ln], out)
+
+    def test_an_empty_prefix_that_really_runs_with_an_empty_prefix_is_a_failure(self):
+        code, out = run_main(self.fake(empty_prefix="empty"))
+        self.assertEqual(code, 1)
+        fails = [ln for ln in self.lines(out, "FAIL") if "prefix \x27\x27 (empty value)" in ln]
+        self.assertTrue(fails and "observed key \x27_max\x27" in fails[0], out)
+        self.assertTrue([ln for ln in self.lines(out, "INFO") if "KV key used: \x27_max\x27" in ln], out)
+
+    def test_an_empty_prefix_whose_key_cannot_be_read_is_unverified(self):
+        code, out = run_main(self.fake(empty_prefix="default", search="error"))
+        self.assertEqual(code, 1)
+        self.assertTrue([ln for ln in self.lines(out, "UNVERIFIED") if "prefix \x27\x27 (empty value)" in ln], out)
+
+    def test_every_valid_prefix_must_produce_exactly_its_own_key(self):
+        code, out = run_main(self.fake(keycheck_override="wrongprefix"))
+        self.assertEqual(code, 1)
+        self.assertTrue([ln for ln in self.lines(out, "FAIL") if "prefix \x27a1\x27 is accepted" in ln and "wrongprefix_max" in ln], out)
+
+    def test_the_observed_key_of_every_valid_prefix_is_recorded(self):
+        _, out = run_main(self.fake())
+        for prefix in rv.VALID_PREFIXES:
+            self.assertTrue([ln for ln in self.lines(out, "INFO") if "prefix %r: observed" % prefix in ln and "%s_max" % prefix in ln], prefix)
 
     def test_a_wrong_candidate_hash_stops_before_any_request(self):
         fake = self.fake()
