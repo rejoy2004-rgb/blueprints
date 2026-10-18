@@ -1,0 +1,114 @@
+name: Kestra production validate_genes test (disposable server)
+
+# PREPARED, NOT PUBLISHED, NOT RUN.
+# Fork-only test of ONE question: what does the ORIGINAL merged production `validate_genes` condition do on a real Kestra 2.0.6 for valid,
+# rejected and predicted-gap gene lists?
+#
+# NEVER include this file or ci/ in the upstream pull request. Publish it ONLY as the root (parentless) commit of the fork branch
+# ci/kestra-production-validation, and only after separate, explicit approval. A push to that branch triggers it.
+#
+# Isolation: the throwaway Kestra has no secrets, no Docker socket, no volumes and a loopback-only port. The production flow is NEVER
+# executed, and not even deployed. Executions run a derived validation-only flow made of Log, Fail and Loop tasks, so no call to NCBI,
+# Slack, or any KV store is possible. Nothing is uploaded. No repository secret is used.
+
+on:
+  push:
+    branches:
+      - ci/kestra-production-validation
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kestra-production-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  KESTRA_IMAGE: kestra/kestra:v2.0.6@sha256:bc2e8b5c639c3ff1f7ba9c1aadef4686a87669895a1d80c23d01c58d45785914
+  # The only flow this job may test. Any other file stops the job.
+  EXPECTED_PRODUCTION_SHA256: 9ce300b17caf749e3033fa004d8f6749568ab5b141ee66ab0ceb7c27780394cb
+  # One PASS per expected check; see expected_keys() in ci/kestra_production_validation/run_production_validation.py.
+  MIN_PASS: "103"
+
+jobs:
+  validation:
+    name: Production validate_genes on Kestra 2.0.6 (validation-only flow)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out this branch (CI files and the production flow copy)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Assert the flow is exactly the reviewed production flow
+        run: |
+          actual="$(sha256sum ci/kestra_production_validation/production/clinvar-variant-reclassification-monitor.yaml | cut -d' ' -f1)"
+          echo "production sha256: $actual"
+          echo "expected:          $EXPECTED_PRODUCTION_SHA256"
+          if [ "$actual" != "$EXPECTED_PRODUCTION_SHA256" ]; then
+            echo "::error title=Wrong flow::the flow differs from the reviewed production flow; stopping"
+            exit 1
+          fi
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML (used by the driver and its unit tests)
+        run: |
+          python -m pip install --disable-pip-version-check --no-input --only-binary=:all: "pyyaml==6.0.3"
+
+      - name: Unit tests of the driver and of this workflow (fake Kestra on loopback, no external network)
+        run: python -I ci/kestra_production_validation/test_run_production_validation.py
+
+      - name: Pull the pinned Kestra image
+        run: docker pull "$KESTRA_IMAGE"
+
+      - name: Start Kestra with throwaway credentials
+        run: |
+          password="Ci1$(openssl rand -hex 16)"
+          b64_password="$(printf '%s' "$password" | base64 -w0)"
+          b64_basic="$(printf '%s' "ci@example.com:$password" | base64 -w0)"
+          echo "::add-mask::$password"
+          echo "::add-mask::$b64_password"
+          echo "::add-mask::$b64_basic"
+          echo "KESTRA_USER=ci@example.com" >> "$GITHUB_ENV"
+          echo "KESTRA_PASSWORD=$password" >> "$GITHUB_ENV"
+          echo "KESTRA_PASSWORD_B64=$b64_password" >> "$GITHUB_ENV"
+          echo "KESTRA_BASIC_B64=$b64_basic" >> "$GITHUB_ENV"
+          config="$(cat <<EOF
+          kestra:
+            anonymous-usage-report:
+              enabled: false
+            ui-anonymous-usage-report:
+              enabled: false
+            server:
+              basic-auth:
+                username: ci@example.com
+                password: $password
+          EOF
+          )"
+          docker run -d --name kestra \
+            -p 127.0.0.1:8080:8080 \
+            -e KESTRA_CONFIGURATION="$config" \
+            "$KESTRA_IMAGE" server local
+
+      - name: Run the validate_genes cases through the REST API
+        run: >
+          python ci/kestra_production_validation/run_production_validation.py
+          --production ci/kestra_production_validation/production/clinvar-variant-reclassification-monitor.yaml
+          --expected-production-sha256 "$EXPECTED_PRODUCTION_SHA256"
+          --base-url http://127.0.0.1:8080
+          --min-pass "$MIN_PASS"
+
+      - name: Kestra server log (errors and warnings only, credentials redacted)
+        if: always()
+        run: |
+          docker logs kestra 2>&1 | sed -e "s|$KESTRA_PASSWORD|***|g" -e "s|$KESTRA_PASSWORD_B64|***|g" -e "s|$KESTRA_BASIC_B64|***|g" | grep -E ' (ERROR|WARN) ' | tail -n 80 || true
+
+      - name: Stop Kestra
+        if: always()
+        run: docker rm -f kestra || true
